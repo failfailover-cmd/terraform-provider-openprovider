@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +20,12 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+)
+
+const (
+	opMaxRetries  = 6
+	opBaseBackoff = 1500 * time.Millisecond
+	opMaxBackoff  = 20 * time.Second
 )
 
 var _ resource.Resource = &domainNameserversResource{}
@@ -76,7 +85,25 @@ func (r *domainNameserversResource) Read(ctx context.Context, req resource.ReadR
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	// API read for exact NS may vary; keep last-known state to avoid destructive drift.
+
+	token, err := r.login(ctx)
+	if err != nil {
+		resp.Diagnostics.AddError("Openprovider API error", err.Error())
+		return
+	}
+
+	ns, status, err := r.fetchNS(ctx, token, st.Domain.ValueString())
+	if err != nil {
+		if status == http.StatusNotFound {
+			resp.State.RemoveResource(ctx)
+			return
+		}
+		resp.Diagnostics.AddError("Openprovider API error", err.Error())
+		return
+	}
+
+	st.ID = st.Domain
+	st.Nameservers, _ = types.ListValueFrom(ctx, types.StringType, ns)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &st)...)
 }
 
@@ -111,65 +138,164 @@ func (r *domainNameserversResource) applyNS(ctx context.Context, plan domainName
 	if diags := plan.Nameservers.ElementsAs(ctx, &ns, false); diags.HasError() {
 		return fmt.Errorf("invalid nameservers list")
 	}
-	parts := strings.SplitN(plan.Domain.ValueString(), ".", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid domain: %s", plan.Domain.ValueString())
+	if len(ns) == 0 {
+		return fmt.Errorf("nameservers list cannot be empty")
 	}
+
 	type nsObj struct {
 		Name string `json:"name"`
 	}
-	body := map[string]any{
-		"name_servers": []nsObj{{Name: ns[0]}},
-	}
 	list := make([]nsObj, 0, len(ns))
 	for _, n := range ns {
-		list = append(list, nsObj{Name: n})
+		list = append(list, nsObj{Name: strings.TrimSpace(n)})
 	}
-	body["name_servers"] = list
+	body := map[string]any{"name_servers": list}
 	b, _ := json.Marshal(body)
+
 	url := strings.TrimRight(r.cfg.BaseURL, "/") + "/domains/" + plan.Domain.ValueString()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(b))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	cli := &http.Client{Timeout: 40 * time.Second}
-	res, err := cli.Do(req)
+	h := map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	}
+	status, raw, err := r.doJSON(ctx, http.MethodPut, url, h, b)
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
-	raw, _ := io.ReadAll(res.Body)
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return fmt.Errorf("PUT /domains failed: status=%d body=%s", res.StatusCode, string(raw))
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("PUT /domains failed: status=%d body=%s", status, raw)
 	}
 	return nil
+}
+
+func (r *domainNameserversResource) fetchNS(ctx context.Context, token, domain string) ([]string, int, error) {
+	url := strings.TrimRight(r.cfg.BaseURL, "/") + "/domains/" + domain
+	h := map[string]string{"Authorization": "Bearer " + token}
+	status, raw, err := r.doJSON(ctx, http.MethodGet, url, h, nil)
+	if err != nil {
+		return nil, status, err
+	}
+	if status == http.StatusNotFound {
+		return nil, status, fmt.Errorf("domain not found")
+	}
+	if status < 200 || status >= 300 {
+		return nil, status, fmt.Errorf("GET /domains failed: status=%d body=%s", status, raw)
+	}
+
+	var out struct {
+		Data struct {
+			NameServers []struct {
+				Name string `json:"name"`
+			} `json:"name_servers"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, status, fmt.Errorf("decode domain payload: %w", err)
+	}
+
+	ns := make([]string, 0, len(out.Data.NameServers))
+	for _, n := range out.Data.NameServers {
+		if strings.TrimSpace(n.Name) != "" {
+			ns = append(ns, strings.ToLower(strings.TrimSpace(n.Name)))
+		}
+	}
+	sort.Strings(ns)
+	return ns, status, nil
 }
 
 func (r *domainNameserversResource) login(ctx context.Context) (string, error) {
 	payload := map[string]string{"username": r.cfg.Username, "password": r.cfg.Password}
 	b, _ := json.Marshal(payload)
 	url := strings.TrimRight(r.cfg.BaseURL, "/") + "/auth/login"
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
-	req.Header.Set("Content-Type", "application/json")
-	cli := &http.Client{Timeout: 30 * time.Second}
-	res, err := cli.Do(req)
+	h := map[string]string{"Content-Type": "application/json"}
+	status, raw, err := r.doJSON(ctx, http.MethodPost, url, h, b)
 	if err != nil {
 		return "", err
 	}
-	defer res.Body.Close()
-	raw, _ := io.ReadAll(res.Body)
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return "", fmt.Errorf("login failed: status=%d body=%s", res.StatusCode, string(raw))
+	if status < 200 || status >= 300 {
+		return "", fmt.Errorf("login failed: status=%d body=%s", status, raw)
 	}
 	var out struct {
 		Data struct {
 			Token string `json:"token"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
 		return "", err
 	}
 	if out.Data.Token == "" {
 		return "", fmt.Errorf("empty token in login response")
 	}
 	return out.Data.Token, nil
+}
+
+func (r *domainNameserversResource) doJSON(ctx context.Context, method, url string, headers map[string]string, body []byte) (int, string, error) {
+	var lastErr error
+	for attempt := 0; attempt <= opMaxRetries; attempt++ {
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, _ := http.NewRequestWithContext(ctx, method, url, reader)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+
+		cli := &http.Client{Timeout: 45 * time.Second}
+		res, err := cli.Do(req)
+		if err != nil {
+			lastErr = err
+			if !isRetryableNetErr(err) || attempt == opMaxRetries {
+				return 0, "", err
+			}
+			time.Sleep(backoff(attempt, ""))
+			continue
+		}
+
+		raw, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		bodyStr := string(raw)
+
+		if retryableStatus(res.StatusCode) && attempt < opMaxRetries {
+			time.Sleep(backoff(attempt, res.Header.Get("Retry-After")))
+			continue
+		}
+
+		if res.StatusCode >= 200 && res.StatusCode < 300 {
+			return res.StatusCode, bodyStr, nil
+		}
+		return res.StatusCode, bodyStr, nil
+	}
+	return 0, "", fmt.Errorf("request retries exhausted: %w", lastErr)
+}
+
+func retryableStatus(code int) bool {
+	if code == http.StatusTooManyRequests || code == 1015 {
+		return true
+	}
+	return code >= 500 && code <= 599
+}
+
+func isRetryableNetErr(err error) bool {
+	if nerr, ok := err.(net.Error); ok {
+		return nerr.Timeout() || nerr.Temporary()
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe")
+}
+
+func backoff(attempt int, retryAfter string) time.Duration {
+	if retryAfter != "" {
+		if sec, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && sec > 0 {
+			d := time.Duration(sec) * time.Second
+			if d > opMaxBackoff {
+				return opMaxBackoff
+			}
+			return d
+		}
+	}
+	d := opBaseBackoff * (1 << attempt)
+	if d > opMaxBackoff {
+		return opMaxBackoff
+	}
+	return d
 }
