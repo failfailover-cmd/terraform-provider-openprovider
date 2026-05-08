@@ -16,16 +16,10 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-)
-
-const (
-	opMaxRetries  = 6
-	opBaseBackoff = 1500 * time.Millisecond
-	opMaxBackoff  = 20 * time.Second
 )
 
 var _ resource.Resource = &domainNameserversResource{}
@@ -36,7 +30,7 @@ type domainNameserversResource struct{ cfg *providerConfig }
 type domainNameserversModel struct {
 	ID          types.String `tfsdk:"id"`
 	Domain      types.String `tfsdk:"domain"`
-	Nameservers types.List   `tfsdk:"nameservers"`
+	Nameservers types.Set    `tfsdk:"nameservers"`
 }
 
 func NewDomainNameserversResource() resource.Resource { return &domainNameserversResource{} }
@@ -49,7 +43,7 @@ func (r *domainNameserversResource) Schema(_ context.Context, _ resource.SchemaR
 	resp.Schema = schema.Schema{Attributes: map[string]schema.Attribute{
 		"id":          schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
 		"domain":      schema.StringAttribute{Required: true, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
-		"nameservers": schema.ListAttribute{Required: true, ElementType: types.StringType, PlanModifiers: []planmodifier.List{listplanmodifier.RequiresReplace()}},
+		"nameservers": schema.SetAttribute{Required: true, ElementType: types.StringType, PlanModifiers: []planmodifier.Set{setplanmodifier.RequiresReplace()}},
 	}}
 }
 
@@ -103,7 +97,7 @@ func (r *domainNameserversResource) Read(ctx context.Context, req resource.ReadR
 	}
 
 	st.ID = st.Domain
-	st.Nameservers, _ = types.ListValueFrom(ctx, types.StringType, ns)
+	st.Nameservers, _ = types.SetValueFrom(ctx, types.StringType, ns)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &st)...)
 }
 
@@ -230,7 +224,7 @@ func (r *domainNameserversResource) login(ctx context.Context) (string, error) {
 
 func (r *domainNameserversResource) doJSON(ctx context.Context, method, url string, headers map[string]string, body []byte) (int, string, error) {
 	var lastErr error
-	for attempt := 0; attempt <= opMaxRetries; attempt++ {
+	for attempt := 0; attempt <= r.cfg.MaxRetries; attempt++ {
 		var reader io.Reader
 		if body != nil {
 			reader = bytes.NewReader(body)
@@ -240,14 +234,14 @@ func (r *domainNameserversResource) doJSON(ctx context.Context, method, url stri
 			req.Header.Set(k, v)
 		}
 
-		cli := &http.Client{Timeout: 45 * time.Second}
+		cli := &http.Client{Timeout: r.cfg.RequestTimeout}
 		res, err := cli.Do(req)
 		if err != nil {
 			lastErr = err
-			if !isRetryableNetErr(err) || attempt == opMaxRetries {
+			if !isRetryableNetErr(err) || attempt == r.cfg.MaxRetries {
 				return 0, "", err
 			}
-			time.Sleep(backoff(attempt, ""))
+			time.Sleep(r.backoff(attempt, ""))
 			continue
 		}
 
@@ -255,8 +249,8 @@ func (r *domainNameserversResource) doJSON(ctx context.Context, method, url stri
 		res.Body.Close()
 		bodyStr := string(raw)
 
-		if retryableStatus(res.StatusCode) && attempt < opMaxRetries {
-			time.Sleep(backoff(attempt, res.Header.Get("Retry-After")))
+		if retryableStatus(res.StatusCode) && attempt < r.cfg.MaxRetries {
+			time.Sleep(r.backoff(attempt, res.Header.Get("Retry-After")))
 			continue
 		}
 
@@ -283,19 +277,19 @@ func isRetryableNetErr(err error) bool {
 	return strings.Contains(msg, "timeout") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe")
 }
 
-func backoff(attempt int, retryAfter string) time.Duration {
+func (r *domainNameserversResource) backoff(attempt int, retryAfter string) time.Duration {
 	if retryAfter != "" {
 		if sec, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && sec > 0 {
 			d := time.Duration(sec) * time.Second
-			if d > opMaxBackoff {
-				return opMaxBackoff
+			if d > r.cfg.MaxBackoff {
+				return r.cfg.MaxBackoff
 			}
 			return d
 		}
 	}
-	d := opBaseBackoff * (1 << attempt)
-	if d > opMaxBackoff {
-		return opMaxBackoff
+	d := r.cfg.BaseBackoff * (1 << attempt)
+	if d > r.cfg.MaxBackoff {
+		return r.cfg.MaxBackoff
 	}
 	return d
 }
