@@ -128,6 +128,10 @@ func (r *domainNameserversResource) applyNS(ctx context.Context, plan domainName
 	if err != nil {
 		return err
 	}
+	domainID, sld, tld, err := r.resolveDomainID(ctx, token, plan.Domain.ValueString())
+	if err != nil {
+		return err
+	}
 	var ns []string
 	if diags := plan.Nameservers.ElementsAs(ctx, &ns, false); diags.HasError() {
 		return fmt.Errorf("invalid nameservers list")
@@ -143,10 +147,17 @@ func (r *domainNameserversResource) applyNS(ctx context.Context, plan domainName
 	for _, n := range ns {
 		list = append(list, nsObj{Name: strings.TrimSpace(n)})
 	}
-	body := map[string]any{"name_servers": list}
+	body := map[string]any{
+		"domain": map[string]string{
+			"name":      sld,
+			"extension": tld,
+		},
+		"name_servers": list,
+		"remove_nses":  true,
+	}
 	b, _ := json.Marshal(body)
 
-	url := strings.TrimRight(r.cfg.BaseURL, "/") + "/domains/" + plan.Domain.ValueString()
+	url := strings.TrimRight(r.cfg.BaseURL, "/") + "/domains/" + domainID
 	h := map[string]string{
 		"Authorization": "Bearer " + token,
 		"Content-Type":  "application/json",
@@ -162,7 +173,11 @@ func (r *domainNameserversResource) applyNS(ctx context.Context, plan domainName
 }
 
 func (r *domainNameserversResource) fetchNS(ctx context.Context, token, domain string) ([]string, int, error) {
-	url := strings.TrimRight(r.cfg.BaseURL, "/") + "/domains/" + domain
+	domainID, _, _, err := r.resolveDomainID(ctx, token, domain)
+	if err != nil {
+		return nil, 0, err
+	}
+	url := strings.TrimRight(r.cfg.BaseURL, "/") + "/domains/" + domainID
 	h := map[string]string{"Authorization": "Bearer " + token}
 	status, raw, err := r.doJSON(ctx, http.MethodGet, url, h, nil)
 	if err != nil {
@@ -194,6 +209,54 @@ func (r *domainNameserversResource) fetchNS(ctx context.Context, token, domain s
 	}
 	sort.Strings(ns)
 	return ns, status, nil
+}
+
+func (r *domainNameserversResource) resolveDomainID(ctx context.Context, token, domain string) (string, string, string, error) {
+	parts := strings.Split(domain, ".")
+	if len(parts) < 2 {
+		return "", "", "", fmt.Errorf("invalid domain: %s", domain)
+	}
+	sld := parts[0]
+	tld := strings.Join(parts[1:], ".")
+
+	q := strings.TrimRight(r.cfg.BaseURL, "/") + "/domains?full_name=" + domain + "&limit=1&offset=0"
+	h := map[string]string{"Authorization": "Bearer " + token}
+	status, raw, err := r.doJSON(ctx, http.MethodGet, q, h, nil)
+	if err != nil {
+		return "", "", "", err
+	}
+	if status < 200 || status >= 300 {
+		return "", "", "", fmt.Errorf("GET /domains search failed: status=%d body=%s", status, raw)
+	}
+
+	var out struct {
+		Data struct {
+			Results []struct {
+				ID       int64  `json:"id"`
+				FullName string `json:"full_name"`
+				Domain   struct {
+					Name      string `json:"name"`
+					Extension string `json:"extension"`
+				} `json:"domain"`
+			} `json:"results"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return "", "", "", fmt.Errorf("decode domains search payload: %w", err)
+	}
+	if len(out.Data.Results) == 0 {
+		return "", "", "", fmt.Errorf("domain not found in openprovider: %s", domain)
+	}
+
+	row := out.Data.Results[0]
+	id := strconv.FormatInt(row.ID, 10)
+	if id == "0" {
+		return "", "", "", fmt.Errorf("invalid domain id for %s", domain)
+	}
+	if row.Domain.Name != "" && row.Domain.Extension != "" {
+		return id, row.Domain.Name, row.Domain.Extension, nil
+	}
+	return id, sld, tld, nil
 }
 
 func (r *domainNameserversResource) login(ctx context.Context) (string, error) {

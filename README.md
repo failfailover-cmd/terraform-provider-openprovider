@@ -1,4 +1,4 @@
-# terraform-provider-openprovider (MVP)
+# terraform-provider-openprovider
 
 Кастомный Terraform provider для Openprovider.
 
@@ -28,7 +28,17 @@ resource "openprovider_domain_nameservers" "example" {
 - `OPENPROVIDER_MAIN_USERNAME`
 - `OPENPROVIDER_MAIN_PASSWORD`
 
-## Ограничения MVP
+## Поведение и ограничения
 
-- `Read` пока сохраняет last-known state без полного reconciliation NS через API.
+- `Read` делает reconciliation NS через Openprovider REST API.
+- Для операций `Read/Update` провайдер резолвит `domain -> domain_id` через `GET /domains`.
 - Операция `Delete` no-op (провайдер не откатывает NS автоматически).
+
+
+Retry tuning:
+- `max_retries`
+- `base_backoff_ms`
+- `max_backoff_ms`
+- `request_timeout_ms`
+
+`nameservers` is handled as a set to avoid diff on ordering.
