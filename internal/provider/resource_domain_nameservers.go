@@ -166,8 +166,122 @@ func (r *domainNameserversResource) applyNS(ctx context.Context, plan domainName
 	if err != nil {
 		return err
 	}
+	if status >= 200 && status < 300 {
+		return nil
+	}
+
+	// Openprovider can reject direct name_servers update with code 245
+	// (Nameserver-update failed) for some TLDs. Fallback to ns_group flow.
+	if isNameserverUpdate245(status, raw) {
+		group, err := r.ensureNSGroup(ctx, token, plan.Domain.ValueString(), ns)
+		if err != nil {
+			return fmt.Errorf("direct nameserver update failed (code 245), ns_group fallback failed: %w", err)
+		}
+		if err := r.applyNSGroup(ctx, token, domainID, sld, tld, group); err != nil {
+			return fmt.Errorf("direct nameserver update failed (code 245), ns_group=%q apply failed: %w", group, err)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("PUT /domains failed: status=%d body=%s", status, raw)
+}
+
+func isNameserverUpdate245(status int, raw string) bool {
+	if status < 400 {
+		return false
+	}
+	rawLower := strings.ToLower(raw)
+	return strings.Contains(rawLower, "\"code\":245") || strings.Contains(rawLower, "nameserver-update failed")
+}
+
+func (r *domainNameserversResource) ensureNSGroup(ctx context.Context, token, domain string, ns []string) (string, error) {
+	group := buildNSGroupName(domain, ns)
+
+	type nsObj struct {
+		Name string `json:"name"`
+	}
+	payload := struct {
+		NSGroup     string  `json:"ns_group"`
+		NameServers []nsObj `json:"name_servers"`
+	}{
+		NSGroup:     group,
+		NameServers: make([]nsObj, 0, len(ns)),
+	}
+	for _, n := range ns {
+		payload.NameServers = append(payload.NameServers, nsObj{Name: strings.TrimSpace(n)})
+	}
+	b, _ := json.Marshal(payload)
+
+	url := strings.TrimRight(r.cfg.BaseURL, "/") + "/dns/nameservers/groups"
+	h := map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	}
+	status, raw, err := r.doJSON(ctx, http.MethodPost, url, h, b)
+	if err != nil {
+		return "", err
+	}
+	if status >= 200 && status < 300 {
+		return group, nil
+	}
+
+	// If group already exists, we can still reuse it.
+	if status == http.StatusConflict || strings.Contains(strings.ToLower(raw), "already exists") {
+		return group, nil
+	}
+
+	return "", fmt.Errorf("POST /dns/nameservers/groups failed: status=%d body=%s", status, raw)
+}
+
+func buildNSGroupName(domain string, ns []string) string {
+	cleanDomain := strings.ToLower(strings.TrimSpace(domain))
+	cleanDomain = strings.ReplaceAll(cleanDomain, ".", "-")
+
+	nsHashInput := strings.ToLower(strings.Join(ns, "|"))
+	sum := fnv32a(nsHashInput)
+
+	// Keep group deterministic and short.
+	base := fmt.Sprintf("tf-%s-%08x", cleanDomain, sum)
+	if len(base) > 63 {
+		return base[:63]
+	}
+	return base
+}
+
+func fnv32a(s string) uint32 {
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	var h uint32 = offset32
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= prime32
+	}
+	return h
+}
+
+func (r *domainNameserversResource) applyNSGroup(ctx context.Context, token, domainID, sld, tld, group string) error {
+	body := map[string]any{
+		"domain": map[string]string{
+			"name":      sld,
+			"extension": tld,
+		},
+		"ns_group": group,
+	}
+	b, _ := json.Marshal(body)
+
+	url := strings.TrimRight(r.cfg.BaseURL, "/") + "/domains/" + domainID
+	h := map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	}
+	status, raw, err := r.doJSON(ctx, http.MethodPut, url, h, b)
+	if err != nil {
+		return err
+	}
 	if status < 200 || status >= 300 {
-		return fmt.Errorf("PUT /domains failed: status=%d body=%s", status, raw)
+		return fmt.Errorf("PUT /domains (ns_group) failed: status=%d body=%s", status, raw)
 	}
 	return nil
 }
