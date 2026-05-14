@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -28,9 +29,11 @@ var _ resource.ResourceWithImportState = &domainNameserversResource{}
 type domainNameserversResource struct{ cfg *providerConfig }
 
 type domainNameserversModel struct {
-	ID          types.String `tfsdk:"id"`
-	Domain      types.String `tfsdk:"domain"`
-	Nameservers types.Set    `tfsdk:"nameservers"`
+	ID            types.String `tfsdk:"id"`
+	Domain        types.String `tfsdk:"domain"`
+	Nameservers   types.Set    `tfsdk:"nameservers"`
+	UseNSGroup    types.Bool   `tfsdk:"use_ns_group"`
+	DisableDNSSEC types.Bool   `tfsdk:"disable_dnssec"`
 }
 
 func NewDomainNameserversResource() resource.Resource { return &domainNameserversResource{} }
@@ -41,9 +44,11 @@ func (r *domainNameserversResource) Metadata(_ context.Context, req resource.Met
 
 func (r *domainNameserversResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{Attributes: map[string]schema.Attribute{
-		"id":          schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
-		"domain":      schema.StringAttribute{Required: true, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
-		"nameservers": schema.SetAttribute{Required: true, ElementType: types.StringType, PlanModifiers: []planmodifier.Set{setplanmodifier.RequiresReplace()}},
+		"id":             schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
+		"domain":         schema.StringAttribute{Required: true, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
+		"nameservers":    schema.SetAttribute{Required: true, ElementType: types.StringType, PlanModifiers: []planmodifier.Set{setplanmodifier.RequiresReplace()}},
+		"use_ns_group":   schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(true)},
+		"disable_dnssec": schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(true)},
 	}}
 }
 
@@ -139,6 +144,33 @@ func (r *domainNameserversResource) applyNS(ctx context.Context, plan domainName
 	if len(ns) == 0 {
 		return fmt.Errorf("nameservers list cannot be empty")
 	}
+	sort.Strings(ns)
+
+	useNSGroup := true
+	if !plan.UseNSGroup.IsNull() && !plan.UseNSGroup.IsUnknown() {
+		useNSGroup = plan.UseNSGroup.ValueBool()
+	}
+	disableDNSSEC := true
+	if !plan.DisableDNSSEC.IsNull() && !plan.DisableDNSSEC.IsUnknown() {
+		disableDNSSEC = plan.DisableDNSSEC.ValueBool()
+	}
+
+	if disableDNSSEC {
+		if err := r.disableDNSSEC(ctx, token, domainID, sld, tld); err != nil {
+			return fmt.Errorf("disable dnssec failed: %w", err)
+		}
+	}
+
+	if useNSGroup {
+		group, err := r.ensureNSGroup(ctx, token, ns)
+		if err != nil {
+			return fmt.Errorf("ensure ns_group failed: %w", err)
+		}
+		if err := r.applyNSGroup(ctx, token, domainID, sld, tld, group); err != nil {
+			return fmt.Errorf("apply ns_group=%q failed: %w", group, err)
+		}
+		return nil
+	}
 
 	type nsObj struct {
 		Name string `json:"name"`
@@ -173,7 +205,7 @@ func (r *domainNameserversResource) applyNS(ctx context.Context, plan domainName
 	// Openprovider can reject direct name_servers update with code 245
 	// (Nameserver-update failed) for some TLDs. Fallback to ns_group flow.
 	if isNameserverUpdate245(status, raw) {
-		group, err := r.ensureNSGroup(ctx, token, plan.Domain.ValueString(), ns)
+		group, err := r.ensureNSGroup(ctx, token, ns)
 		if err != nil {
 			return fmt.Errorf("direct nameserver update failed (code 245), ns_group fallback failed: %w", err)
 		}
@@ -194,8 +226,8 @@ func isNameserverUpdate245(status int, raw string) bool {
 	return strings.Contains(rawLower, "\"code\":245") || strings.Contains(rawLower, "nameserver-update failed")
 }
 
-func (r *domainNameserversResource) ensureNSGroup(ctx context.Context, token, domain string, ns []string) (string, error) {
-	group := buildNSGroupName(domain, ns)
+func (r *domainNameserversResource) ensureNSGroup(ctx context.Context, token string, ns []string) (string, error) {
+	group := buildNSGroupName(ns)
 
 	type nsObj struct {
 		Name string `json:"name"`
@@ -233,15 +265,12 @@ func (r *domainNameserversResource) ensureNSGroup(ctx context.Context, token, do
 	return "", fmt.Errorf("POST /dns/nameservers/groups failed: status=%d body=%s", status, raw)
 }
 
-func buildNSGroupName(domain string, ns []string) string {
-	cleanDomain := strings.ToLower(strings.TrimSpace(domain))
-	cleanDomain = strings.ReplaceAll(cleanDomain, ".", "-")
-
+func buildNSGroupName(ns []string) string {
 	nsHashInput := strings.ToLower(strings.Join(ns, "|"))
 	sum := fnv32a(nsHashInput)
 
-	// Keep group deterministic and short.
-	base := fmt.Sprintf("tf-%s-%08x", cleanDomain, sum)
+	// Shared deterministic group for all domains with same NS pair.
+	base := fmt.Sprintf("tf-cf-ns-%08x", sum)
 	if len(base) > 63 {
 		return base[:63]
 	}
@@ -284,6 +313,38 @@ func (r *domainNameserversResource) applyNSGroup(ctx context.Context, token, dom
 		return fmt.Errorf("PUT /domains (ns_group) failed: status=%d body=%s", status, raw)
 	}
 	return nil
+}
+
+func (r *domainNameserversResource) disableDNSSEC(ctx context.Context, token, domainID, sld, tld string) error {
+	body := map[string]any{
+		"domain": map[string]string{
+			"name":      sld,
+			"extension": tld,
+		},
+		"is_dnssec_enabled": false,
+		"dnssec_keys":       []any{},
+	}
+	b, _ := json.Marshal(body)
+
+	url := strings.TrimRight(r.cfg.BaseURL, "/") + "/domains/" + domainID
+	h := map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	}
+	status, raw, err := r.doJSON(ctx, http.MethodPut, url, h, b)
+	if err != nil {
+		return err
+	}
+	if status >= 200 && status < 300 {
+		return nil
+	}
+
+	rawLower := strings.ToLower(raw)
+	// Some TLDs/accounts may return not-applicable style errors if DNSSEC is already off.
+	if strings.Contains(rawLower, "dnssec") && (strings.Contains(rawLower, "already") || strings.Contains(rawLower, "disabled") || strings.Contains(rawLower, "not enabled")) {
+		return nil
+	}
+	return fmt.Errorf("PUT /domains (disable dnssec) failed: status=%d body=%s", status, raw)
 }
 
 func (r *domainNameserversResource) fetchNS(ctx context.Context, token, domain string) ([]string, int, error) {
